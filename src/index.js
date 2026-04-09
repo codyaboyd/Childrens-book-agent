@@ -139,7 +139,7 @@ function extractOpenAiStyleContent(json, providerName) {
   return String(content).trim();
 }
 
-async function callLlm({ system, user }) {
+async function callLlm({ system, user, temperature = 0.4 }) {
   const provider = resolveLlmProvider();
 
   if (provider === "llama") {
@@ -150,7 +150,7 @@ async function callLlm({ system, user }) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         model,
-        temperature: 0.7,
+        temperature,
         messages: [
           { role: "system", content: system },
           { role: "user", content: user }
@@ -177,7 +177,7 @@ async function callLlm({ system, user }) {
       },
       body: JSON.stringify({
         model,
-        temperature: 0.7,
+        temperature,
         messages: [
           { role: "system", content: system },
           { role: "user", content: user }
@@ -202,7 +202,7 @@ async function callLlm({ system, user }) {
       body: JSON.stringify({
         systemInstruction: { parts: [{ text: system }] },
         contents: [{ role: "user", parts: [{ text: user }] }],
-        generationConfig: { temperature: 0.7 }
+        generationConfig: { temperature }
       })
     });
     if (!response.ok) {
@@ -234,7 +234,7 @@ async function callLlm({ system, user }) {
       body: JSON.stringify({
         model,
         max_tokens: 2048,
-        temperature: 0.7,
+        temperature,
         system,
         messages: [{ role: "user", content: user }]
       })
@@ -263,7 +263,7 @@ async function callLlm({ system, user }) {
     },
     body: JSON.stringify({
       model,
-      temperature: 0.7,
+      temperature,
       messages: [
         { role: "system", content: system },
         { role: "user", content: user }
@@ -319,8 +319,9 @@ async function withRetry(task, { retries = 2, name = "operation" } = {}) {
 
 async function generateConcept(seedPrompt) {
   const content = await callLlm({
-    system: "You create short, age-appropriate children's story concepts.",
-    user: `Create one children's book concept from this seed:\n${seedPrompt}\n\nReturn JSON only with keys: title, audience, coreLesson, setting, characters.`
+    system: "You create short, age-appropriate children's story concepts. Be concrete and internally consistent.",
+    user: `Create one children's book concept from this seed:\n${seedPrompt}\n\nReturn JSON only with keys: title, audience, coreLesson, setting, characters.`,
+    temperature: 0.5
   });
   return CONCEPT_SCHEMA.parse(parseJsonFromModel(content));
 }
@@ -334,7 +335,8 @@ Return JSON only with keys:
 - prompt: a concise seed prompt that can be fed into a book-generation pipeline
 - suggestedTitle: a short title
 - suggestedAudience: age range like "4-8"
-- rationale: one sentence about why this idea is engaging for children.`
+- rationale: one sentence about why this idea is engaging for children.`,
+    temperature: 0.8
   });
 
   return z
@@ -349,18 +351,30 @@ Return JSON only with keys:
 
 async function planPages(concept, pageCount) {
   const content = await callLlm({
-    system: "You are a children's book planner.",
-    user: `Using this concept:\n${JSON.stringify(concept, null, 2)}\n\nCreate exactly ${pageCount} page beats.\nReturn JSON array only. Each item: { pageNumber, label, events: string[] }`
+    system: "You are a children's book planner focused on tight narrative continuity.",
+    user: `Using this concept:\n${JSON.stringify(concept, null, 2)}\n\nCreate exactly ${pageCount} page beats.\nRequirements:\n- page numbers must run 1..${pageCount} with no gaps.\n- labels should be short and specific.\n- each page should move the story forward from the previous page.\nReturn JSON array only. Each item: { pageNumber, label, events: string[] }`,
+    temperature: 0.2
   });
 
   const parsed = parseJsonFromModel(content);
   return PAGE_SCHEMA.parse(parsed);
 }
 
+async function repairPagePlan({ concept, pageCount, brokenPlan }) {
+  const content = await callLlm({
+    system: "You repair children's book page plans. Return valid JSON only.",
+    user: `Repair this page plan so it is complete and internally consistent.\n\nConcept:\n${JSON.stringify(concept, null, 2)}\n\nTarget page count: ${pageCount}\n\nBroken plan:\n${JSON.stringify(brokenPlan, null, 2)}\n\nRules:\n- Return exactly ${pageCount} items.\n- Use page numbers 1..${pageCount} exactly once each.\n- Keep labels concise and clear.\n- Keep each events array non-empty and story-progressing.\n- Return JSON array only in this shape: [{ "pageNumber": number, "label": string, "events": string[] }].`,
+    temperature: 0.1
+  });
+
+  return PAGE_SCHEMA.parse(parseJsonFromModel(content));
+}
+
 async function writePages(concept, beats) {
   const content = await callLlm({
     system: "You write warm, simple, vivid storybook pages for kids ages 4-8.",
-    user: `Write page text from this concept and plan.\n\nConcept:\n${JSON.stringify(concept, null, 2)}\n\nPlan:\n${JSON.stringify(beats, null, 2)}\n\nReturn JSON array only. Each item: { pageNumber, label, text }. Keep each page text to 55-95 words.`
+    user: `Write page text from this concept and plan.\n\nConcept:\n${JSON.stringify(concept, null, 2)}\n\nPlan:\n${JSON.stringify(beats, null, 2)}\n\nRules:\n- Use exactly one entry per plan pageNumber.\n- Use the exact label from the matching plan beat.\n- Keep story continuity across pages (same character names and setting details).\n- Keep each page text to 55-95 words.\n\nReturn JSON array only. Each item: { pageNumber, label, text }.`,
+    temperature: 0.35
   });
 
   const parsed = parseJsonFromModel(content);
@@ -370,7 +384,8 @@ async function writePages(concept, beats) {
 async function repairStoryPages({ concept, beats, brokenPages }) {
   const content = await callLlm({
     system: "You repair children's story page JSON. Return valid JSON only.",
-    user: `Repair this page array so it exactly matches the beat plan and keeps age 4-8 language.\n\nConcept:\n${JSON.stringify(concept, null, 2)}\n\nPlan:\n${JSON.stringify(beats, null, 2)}\n\nBroken pages:\n${JSON.stringify(brokenPages, null, 2)}\n\nRules:\n- Keep exactly one entry per page number in the plan.\n- Keep each text 55-95 words.\n- Keep tone warm, concrete, and child-safe.\n- Return JSON array only in this shape: [{ "pageNumber": number, "label": string, "text": string }].`
+    user: `Repair this page array so it exactly matches the beat plan and keeps age 4-8 language.\n\nConcept:\n${JSON.stringify(concept, null, 2)}\n\nPlan:\n${JSON.stringify(beats, null, 2)}\n\nBroken pages:\n${JSON.stringify(brokenPages, null, 2)}\n\nRules:\n- Keep exactly one entry per page number in the plan.\n- Keep each text 55-95 words.\n- Keep tone warm, concrete, and child-safe.\n- Return JSON array only in this shape: [{ "pageNumber": number, "label": string, "text": string }].`,
+    temperature: 0.1
   });
 
   return STORY_PAGE_SCHEMA.parse(parseJsonFromModel(content));
@@ -378,6 +393,7 @@ async function repairStoryPages({ concept, beats, brokenPages }) {
 
 function validateStoryCoverage(storyPages, beats) {
   const expected = new Set(beats.map((beat) => beat.pageNumber));
+  const beatByPage = new Map(beats.map((beat) => [beat.pageNumber, beat]));
   const seen = new Set();
   for (const page of storyPages) {
     if (!expected.has(page.pageNumber)) {
@@ -386,11 +402,42 @@ function validateStoryCoverage(storyPages, beats) {
     if (seen.has(page.pageNumber)) {
       throw new Error(`Story pages included duplicate pageNumber=${page.pageNumber}`);
     }
+    const expectedLabel = beatByPage.get(page.pageNumber)?.label;
+    if (expectedLabel && page.label.trim() !== expectedLabel.trim()) {
+      throw new Error(
+        `Story page label mismatch for pageNumber=${page.pageNumber}. Expected "${expectedLabel}", got "${page.label}".`
+      );
+    }
     seen.add(page.pageNumber);
   }
   if (seen.size !== expected.size) {
     throw new Error(`Story pages count mismatch. Expected ${expected.size}, got ${seen.size}.`);
   }
+}
+
+function validatePagePlanCoverage(planPages, pageCount) {
+  const seen = new Set();
+  for (const page of planPages) {
+    if (page.pageNumber < 1 || page.pageNumber > pageCount) {
+      throw new Error(`Plan included out-of-range pageNumber=${page.pageNumber}`);
+    }
+    if (seen.has(page.pageNumber)) {
+      throw new Error(`Plan included duplicate pageNumber=${page.pageNumber}`);
+    }
+    seen.add(page.pageNumber);
+  }
+
+  if (seen.size !== pageCount) {
+    throw new Error(`Plan page count mismatch. Expected ${pageCount}, got ${seen.size}.`);
+  }
+}
+
+function alignStoryPageLabelsWithPlan(storyPages, beats) {
+  const beatByPage = new Map(beats.map((beat) => [beat.pageNumber, beat]));
+  return storyPages.map((page) => ({
+    ...page,
+    label: beatByPage.get(page.pageNumber)?.label ?? page.label
+  }));
 }
 
 async function makeImagePrompt(page) {
@@ -609,15 +656,24 @@ async function runSingleBook({ prompt, title, author, pages, outDir }) {
   const finalTitle = concept.title;
 
   console.log("2) Planning pages...");
-  const beats = await withRetry(() => planPages(concept, pages), { name: "plan pages" });
+  let beats = await withRetry(() => planPages(concept, pages), { name: "plan pages" });
+  try {
+    validatePagePlanCoverage(beats, pages);
+  } catch (error) {
+    console.warn(`Plan validation failed. Repairing plan once... (${error.message})`);
+    beats = await withRetry(() => repairPagePlan({ concept, pageCount: pages, brokenPlan: beats }), { name: "repair page plan" });
+    validatePagePlanCoverage(beats, pages);
+  }
 
   console.log("3) Writing page text...");
   let storyPages = await withRetry(() => writePages(concept, beats), { name: "write pages" });
+  storyPages = alignStoryPageLabelsWithPlan(storyPages, beats);
   try {
     validateStoryCoverage(storyPages, beats);
   } catch (error) {
     console.warn(`Story validation failed. Repairing pages once... (${error.message})`);
     storyPages = await withRetry(() => repairStoryPages({ concept, beats, brokenPages: storyPages }), { name: "repair pages" });
+    storyPages = alignStoryPageLabelsWithPlan(storyPages, beats);
     validateStoryCoverage(storyPages, beats);
   }
 
