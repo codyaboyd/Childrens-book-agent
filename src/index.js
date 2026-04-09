@@ -20,6 +20,31 @@ const STORY_PAGE_SCHEMA = z.array(
   })
 );
 
+const CONTINUITY_ASSET_PLAN_SCHEMA = z.object({
+  styleAnchor: z.string().min(10),
+  characters: z.array(
+    z.object({
+      id: z.string().min(2),
+      name: z.string().min(2),
+      visualDescription: z.string().min(10)
+    })
+  ),
+  scenery: z.array(
+    z.object({
+      id: z.string().min(2),
+      name: z.string().min(2),
+      visualDescription: z.string().min(10)
+    })
+  )
+});
+
+const CONTINUITY_SCENE_SCHEMA = z.object({
+  pageNumber: z.number().int().positive(),
+  sceneDescription: z.string().min(20),
+  characterAssetIds: z.array(z.string()),
+  sceneryAssetIds: z.array(z.string())
+});
+
 function parseArgs(argv) {
   const args = {
     prompt: "",
@@ -51,7 +76,7 @@ function parseArgs(argv) {
 }
 
 function printHelp() {
-  console.log(`\nChildren's Book Agent (Bun + JavaScript)\n\nUsage:\n  bun run src/index.js --prompt \"A shy dragon learns to sing\" [options]\n\nOptions:\n  --title  <string>   Ebook title (default: My AI Storybook)\n  --author <string>   Ebook author (default: Children's Book Agent)\n  --pages  <number>   Number of pages to create (default: 10)\n  --out    <path>     Output directory (default: output)\n  --help              Show this help\n\nEnvironment:\n  LLAMA_API_URL       Default: http://127.0.0.1:8080/v1/chat/completions\n  LLAMA_MODEL         Default: local-model\n  SD_API_URL          Default: http://127.0.0.1:7860/sdapi/v1/txt2img\n  SD_STEPS            Default: 30\n  SD_WIDTH            Default: 768\n  SD_HEIGHT           Default: 768\n`);
+  console.log(`\nChildren's Book Agent (Bun + JavaScript)\n\nUsage:\n  bun run src/index.js --prompt \"A shy dragon learns to sing\" [options]\n\nOptions:\n  --title  <string>   Ebook title (default: My AI Storybook)\n  --author <string>   Ebook author (default: Children's Book Agent)\n  --pages  <number>   Number of pages to create (default: 10)\n  --out    <path>     Output directory (default: output)\n  --help              Show this help\n\nEnvironment:\n  LLAMA_API_URL           Default: http://127.0.0.1:8080/v1/chat/completions\n  LLAMA_MODEL             Default: local-model\n  NANO_BANANA_API_URL     Optional. Endpoint for Google Nano Banana image generation + scene composition\n  NANO_BANANA_API_KEY     Optional auth token sent as Bearer\n  SD_API_URL              Default: http://127.0.0.1:7860/sdapi/v1/txt2img (fallback if Nano Banana fails)\n  SD_STEPS                Default: 30\n  SD_WIDTH                Default: 768\n  SD_HEIGHT               Default: 768\n`);
 }
 
 async function callLlama({ system, user }) {
@@ -88,6 +113,23 @@ async function callLlama({ system, user }) {
 function parseJsonFromModel(text) {
   const cleaned = text.replace(/^```json\s*/i, "").replace(/^```/i, "").replace(/```$/i, "").trim();
   return JSON.parse(cleaned);
+}
+
+async function withRetry(task, { retries = 2, name = "operation" } = {}) {
+  let lastError;
+  for (let attempt = 1; attempt <= retries + 1; attempt++) {
+    try {
+      return await task();
+    } catch (error) {
+      lastError = error;
+      if (attempt <= retries) {
+        const waitMs = 400 * attempt;
+        console.warn(`${name} failed on attempt ${attempt}, retrying in ${waitMs}ms...`);
+        await Bun.sleep(waitMs);
+      }
+    }
+  }
+  throw lastError;
 }
 
 async function generateConcept(seedPrompt) {
@@ -127,7 +169,98 @@ async function makeImagePrompt(page) {
   return content.replace(/^"|"$/g, "").trim();
 }
 
-async function generateImage(prompt, outputPath) {
+async function planContinuityAssets({ concept, beats, storyPages }) {
+  const content = await callLlama({
+    system: "You plan reusable visual assets for continuity in children's picture books.",
+    user: `You must return JSON only.\nGiven this concept, beat plan, and story pages, create a reusable visual asset plan.\n\nConcept:\n${JSON.stringify(concept, null, 2)}\n\nBeats:\n${JSON.stringify(beats, null, 2)}\n\nStory Pages:\n${JSON.stringify(storyPages, null, 2)}\n\nRules:\n- Create stable IDs in kebab-case.\n- Include recurring main characters and important scenery/backgrounds that should persist across pages.\n- styleAnchor should define one consistent illustration style for the whole book.\n\nReturn shape:\n{\n  \"styleAnchor\": string,\n  \"characters\": [{ \"id\": string, \"name\": string, \"visualDescription\": string }],\n  \"scenery\": [{ \"id\": string, \"name\": string, \"visualDescription\": string }]\n}`
+  });
+
+  return CONTINUITY_ASSET_PLAN_SCHEMA.parse(parseJsonFromModel(content));
+}
+
+async function planPageContinuityScene({ page, assetPlan }) {
+  const content = await callLlama({
+    system: "You map a story page to reusable visual assets while preserving continuity.",
+    user: `Return JSON only.\nGiven this page and asset plan, build a scene composition instruction that reuses only relevant assets.\n\nAsset plan:\n${JSON.stringify(assetPlan, null, 2)}\n\nPage:\n${JSON.stringify(page, null, 2)}\n\nRules:\n- characterAssetIds and sceneryAssetIds must be arrays of IDs from the asset plan.\n- sceneDescription should explain actions, camera, and mood while preserving visual consistency from styleAnchor.\n\nReturn shape:\n{\n  \"pageNumber\": number,\n  \"sceneDescription\": string,\n  \"characterAssetIds\": string[],\n  \"sceneryAssetIds\": string[]\n}`
+  });
+
+  return CONTINUITY_SCENE_SCHEMA.parse(parseJsonFromModel(content));
+}
+
+function resolveNanoBananaConfig() {
+  const url = process.env.NANO_BANANA_API_URL?.trim();
+  if (!url) return null;
+
+  return {
+    url,
+    apiKey: process.env.NANO_BANANA_API_KEY?.trim() || null
+  };
+}
+
+function toDataUriFromPngBase64(base64Data) {
+  return `data:image/png;base64,${base64Data}`;
+}
+
+async function callNanoBanana({ mode, payload }) {
+  const config = resolveNanoBananaConfig();
+  if (!config) {
+    throw new Error("NANO_BANANA_API_URL is not set");
+  }
+
+  const headers = { "Content-Type": "application/json" };
+  if (config.apiKey) {
+    headers.Authorization = `Bearer ${config.apiKey}`;
+  }
+
+  const response = await fetch(config.url, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ mode, ...payload })
+  });
+
+  if (!response.ok) {
+    const body = await response.text();
+    throw new Error(`Nano Banana API failed (${response.status}): ${body}`);
+  }
+
+  return response.json();
+}
+
+async function generateContinuityAsset(asset, type, styleAnchor, assetsDir) {
+  const assetFileName = `${asset.id}.png`;
+  const outputPath = path.join(assetsDir, assetFileName);
+
+  const json = await withRetry(
+    () =>
+      callNanoBanana({
+        mode: "generate_asset",
+        payload: {
+          assetType: type,
+          assetId: asset.id,
+          name: asset.name,
+          description: asset.visualDescription,
+          styleAnchor,
+          outputFormat: "png"
+        }
+      }),
+    { name: `Nano Banana asset ${asset.id}` }
+  );
+
+  const base64 = json?.imageBase64;
+  if (!base64) {
+    throw new Error(`Nano Banana asset response missing imageBase64 for ${asset.id}`);
+  }
+
+  await writeFile(outputPath, Buffer.from(base64, "base64"));
+  return {
+    ...asset,
+    assetType: type,
+    imagePath: outputPath,
+    imageDataUri: toDataUriFromPngBase64(base64)
+  };
+}
+
+async function generateImageWithStableDiffusion(prompt, outputPath) {
   const url = process.env.SD_API_URL ?? "http://127.0.0.1:7860/sdapi/v1/txt2img";
   const steps = Number(process.env.SD_STEPS ?? "30");
   const width = Number(process.env.SD_WIDTH ?? "768");
@@ -162,6 +295,48 @@ async function generateImage(prompt, outputPath) {
   return outputPath;
 }
 
+async function generateImageFromContinuityAssets({ scenePlan, assetMap, outputPath, fallbackPrompt }) {
+  const characterAssets = scenePlan.characterAssetIds.map((id) => assetMap.get(id)).filter(Boolean);
+  const sceneryAssets = scenePlan.sceneryAssetIds.map((id) => assetMap.get(id)).filter(Boolean);
+
+  try {
+    const json = await withRetry(
+      () =>
+        callNanoBanana({
+          mode: "compose_scene",
+          payload: {
+            pageNumber: scenePlan.pageNumber,
+            sceneDescription: scenePlan.sceneDescription,
+            characterAssets: characterAssets.map((asset) => ({
+              id: asset.id,
+              name: asset.name,
+              image: asset.imageDataUri
+            })),
+            sceneryAssets: sceneryAssets.map((asset) => ({
+              id: asset.id,
+              name: asset.name,
+              image: asset.imageDataUri
+            })),
+            outputFormat: "png"
+          }
+        }),
+      { name: `Nano Banana scene page ${scenePlan.pageNumber}` }
+    );
+
+    const base64 = json?.imageBase64;
+    if (!base64) {
+      throw new Error("Nano Banana scene response missing imageBase64");
+    }
+
+    await writeFile(outputPath, Buffer.from(base64, "base64"));
+    return { imagePath: outputPath, renderer: "nano-banana" };
+  } catch (error) {
+    console.warn(`Nano Banana compose failed for page ${scenePlan.pageNumber}. Falling back to Stable Diffusion.`, error.message);
+    await generateImageWithStableDiffusion(fallbackPrompt, outputPath);
+    return { imagePath: outputPath, renderer: "stable-diffusion-fallback", fallbackReason: error.message };
+  }
+}
+
 async function buildEbook({ title, author, pages, outputFile }) {
   const content = pages.map((page) => ({
     title: `Page ${page.pageNumber}: ${page.label}`,
@@ -192,7 +367,9 @@ async function main() {
   const args = parseArgs(process.argv.slice(2));
   await mkdir(args.outDir, { recursive: true });
   const imagesDir = path.join(args.outDir, "images");
+  const assetsDir = path.join(args.outDir, "assets");
   await mkdir(imagesDir, { recursive: true });
+  await mkdir(assetsDir, { recursive: true });
 
   console.log("1) Generating concept...");
   const concept = await generateConcept(args.prompt);
@@ -204,24 +381,47 @@ async function main() {
   console.log("3) Writing page text...");
   const storyPages = await writePages(concept, beats);
 
+  console.log("4) Planning reusable continuity assets...");
+  const continuityAssetPlan = await planContinuityAssets({ concept, beats, storyPages });
+
+  console.log("5) Generating continuity asset images...");
+  const generatedCharacters = await Promise.all(
+    continuityAssetPlan.characters.map((asset) => generateContinuityAsset(asset, "character", continuityAssetPlan.styleAnchor, assetsDir))
+  );
+  const generatedScenery = await Promise.all(
+    continuityAssetPlan.scenery.map((asset) => generateContinuityAsset(asset, "scenery", continuityAssetPlan.styleAnchor, assetsDir))
+  );
+
+  const assetMap = new Map([...generatedCharacters, ...generatedScenery].map((asset) => [asset.id, asset]));
+
   const assembled = [];
-  console.log("4) Generating image prompts + images...");
+  console.log("6) Building page scenes from reusable assets...");
   for (const page of storyPages.sort((a, b) => a.pageNumber - b.pageNumber)) {
     const imagePrompt = await makeImagePrompt(page);
+    const scenePlan = await planPageContinuityScene({ page, assetPlan: continuityAssetPlan });
     const imagePath = path.join(imagesDir, `page-${String(page.pageNumber).padStart(2, "0")}.png`);
-    await generateImage(imagePrompt, imagePath);
+
+    const renderResult = await generateImageFromContinuityAssets({
+      scenePlan,
+      assetMap,
+      outputPath: imagePath,
+      fallbackPrompt: imagePrompt
+    });
 
     const bundle = {
       ...page,
       imagePrompt,
-      imagePath
+      imagePath: renderResult.imagePath,
+      renderer: renderResult.renderer,
+      fallbackReason: renderResult.fallbackReason ?? null,
+      scenePlan
     };
 
     assembled.push(bundle);
     await writeFile(path.join(args.outDir, `page-${String(page.pageNumber).padStart(2, "0")}.json`), JSON.stringify(bundle, null, 2));
   }
 
-  console.log("5) Building ebook...");
+  console.log("7) Building ebook...");
   const ebookPath = path.join(args.outDir, `${slugify(args.title)}.epub`);
   await buildEbook({
     title: args.title,
@@ -230,8 +430,15 @@ async function main() {
     outputFile: ebookPath
   });
 
+  const continuityAssetManifest = {
+    styleAnchor: continuityAssetPlan.styleAnchor,
+    characters: generatedCharacters.map(({ imageDataUri, ...rest }) => rest),
+    scenery: generatedScenery.map(({ imageDataUri, ...rest }) => rest)
+  };
+
   await writeFile(path.join(args.outDir, "concept.json"), JSON.stringify(concept, null, 2));
   await writeFile(path.join(args.outDir, "plan.json"), JSON.stringify(beats, null, 2));
+  await writeFile(path.join(args.outDir, "continuity-assets.json"), JSON.stringify(continuityAssetManifest, null, 2));
   await writeFile(path.join(args.outDir, "book.json"), JSON.stringify(assembled, null, 2));
 
   console.log(`Done. EPUB written to: ${ebookPath}`);
