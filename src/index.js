@@ -20,6 +20,14 @@ const STORY_PAGE_SCHEMA = z.array(
   })
 );
 
+const CONCEPT_SCHEMA = z.object({
+  title: z.string().min(3),
+  audience: z.string().min(2),
+  coreLesson: z.string().min(5),
+  setting: z.string().min(3),
+  characters: z.array(z.string().min(2)).min(1)
+});
+
 const CONTINUITY_ASSET_PLAN_SCHEMA = z.object({
   styleAnchor: z.string().min(10),
   characters: z.array(
@@ -250,8 +258,26 @@ async function callLlm({ system, user }) {
 }
 
 function parseJsonFromModel(text) {
-  const cleaned = text.replace(/^```json\s*/i, "").replace(/^```/i, "").replace(/```$/i, "").trim();
-  return JSON.parse(cleaned);
+  const cleaned = text
+    .replace(/^```json\s*/i, "")
+    .replace(/^```/i, "")
+    .replace(/```$/i, "")
+    .trim();
+
+  try {
+    return JSON.parse(cleaned);
+  } catch {
+    const startObject = cleaned.indexOf("{");
+    const startArray = cleaned.indexOf("[");
+    const start = startObject === -1 ? startArray : startArray === -1 ? startObject : Math.min(startObject, startArray);
+    const endObject = cleaned.lastIndexOf("}");
+    const endArray = cleaned.lastIndexOf("]");
+    const end = Math.max(endObject, endArray);
+    if (start === -1 || end === -1 || end <= start) {
+      throw new Error("Model output did not contain valid JSON.");
+    }
+    return JSON.parse(cleaned.slice(start, end + 1));
+  }
 }
 
 async function withRetry(task, { retries = 2, name = "operation" } = {}) {
@@ -276,7 +302,7 @@ async function generateConcept(seedPrompt) {
     system: "You create short, age-appropriate children's story concepts.",
     user: `Create one children's book concept from this seed:\n${seedPrompt}\n\nReturn JSON only with keys: title, audience, coreLesson, setting, characters.`
   });
-  return parseJsonFromModel(content);
+  return CONCEPT_SCHEMA.parse(parseJsonFromModel(content));
 }
 
 async function planPages(concept, pageCount) {
@@ -297,6 +323,32 @@ async function writePages(concept, beats) {
 
   const parsed = parseJsonFromModel(content);
   return STORY_PAGE_SCHEMA.parse(parsed);
+}
+
+async function repairStoryPages({ concept, beats, brokenPages }) {
+  const content = await callLlm({
+    system: "You repair children's story page JSON. Return valid JSON only.",
+    user: `Repair this page array so it exactly matches the beat plan and keeps age 4-8 language.\n\nConcept:\n${JSON.stringify(concept, null, 2)}\n\nPlan:\n${JSON.stringify(beats, null, 2)}\n\nBroken pages:\n${JSON.stringify(brokenPages, null, 2)}\n\nRules:\n- Keep exactly one entry per page number in the plan.\n- Keep each text 55-95 words.\n- Keep tone warm, concrete, and child-safe.\n- Return JSON array only in this shape: [{ "pageNumber": number, "label": string, "text": string }].`
+  });
+
+  return STORY_PAGE_SCHEMA.parse(parseJsonFromModel(content));
+}
+
+function validateStoryCoverage(storyPages, beats) {
+  const expected = new Set(beats.map((beat) => beat.pageNumber));
+  const seen = new Set();
+  for (const page of storyPages) {
+    if (!expected.has(page.pageNumber)) {
+      throw new Error(`Story pages included unexpected pageNumber=${page.pageNumber}`);
+    }
+    if (seen.has(page.pageNumber)) {
+      throw new Error(`Story pages included duplicate pageNumber=${page.pageNumber}`);
+    }
+    seen.add(page.pageNumber);
+  }
+  if (seen.size !== expected.size) {
+    throw new Error(`Story pages count mismatch. Expected ${expected.size}, got ${seen.size}.`);
+  }
 }
 
 async function makeImagePrompt(page) {
@@ -512,41 +564,77 @@ async function main() {
   await mkdir(assetsDir, { recursive: true });
 
   console.log("1) Generating concept...");
-  const concept = await generateConcept(args.prompt);
+  const concept = await withRetry(() => generateConcept(args.prompt), { name: "generate concept" });
   concept.title = args.title || concept.title;
 
   console.log("2) Planning pages...");
-  const beats = await planPages(concept, args.pages);
+  const beats = await withRetry(() => planPages(concept, args.pages), { name: "plan pages" });
 
   console.log("3) Writing page text...");
-  const storyPages = await writePages(concept, beats);
+  let storyPages = await withRetry(() => writePages(concept, beats), { name: "write pages" });
+  try {
+    validateStoryCoverage(storyPages, beats);
+  } catch (error) {
+    console.warn(`Story validation failed. Repairing pages once... (${error.message})`);
+    storyPages = await withRetry(() => repairStoryPages({ concept, beats, brokenPages: storyPages }), { name: "repair pages" });
+    validateStoryCoverage(storyPages, beats);
+  }
 
-  console.log("4) Planning reusable continuity assets...");
-  const continuityAssetPlan = await planContinuityAssets({ concept, beats, storyPages });
+  let continuityAssetPlan = null;
+  let generatedCharacters = [];
+  let generatedScenery = [];
+  let assetMap = new Map();
+  const nanoBananaEnabled = Boolean(resolveNanoBananaConfig());
 
-  console.log("5) Generating continuity asset images...");
-  const generatedCharacters = await Promise.all(
-    continuityAssetPlan.characters.map((asset) => generateContinuityAsset(asset, "character", continuityAssetPlan.styleAnchor, assetsDir))
-  );
-  const generatedScenery = await Promise.all(
-    continuityAssetPlan.scenery.map((asset) => generateContinuityAsset(asset, "scenery", continuityAssetPlan.styleAnchor, assetsDir))
-  );
+  if (nanoBananaEnabled) {
+    try {
+      console.log("4) Planning reusable continuity assets...");
+      continuityAssetPlan = await withRetry(
+        () => planContinuityAssets({ concept, beats, storyPages }),
+        { name: "plan continuity assets" }
+      );
 
-  const assetMap = new Map([...generatedCharacters, ...generatedScenery].map((asset) => [asset.id, asset]));
+      console.log("5) Generating continuity asset images...");
+      generatedCharacters = await Promise.all(
+        continuityAssetPlan.characters.map((asset) => generateContinuityAsset(asset, "character", continuityAssetPlan.styleAnchor, assetsDir))
+      );
+      generatedScenery = await Promise.all(
+        continuityAssetPlan.scenery.map((asset) => generateContinuityAsset(asset, "scenery", continuityAssetPlan.styleAnchor, assetsDir))
+      );
+      assetMap = new Map([...generatedCharacters, ...generatedScenery].map((asset) => [asset.id, asset]));
+    } catch (error) {
+      console.warn(`Continuity asset workflow failed; falling back to Stable Diffusion-only rendering. ${error.message}`);
+      continuityAssetPlan = null;
+      generatedCharacters = [];
+      generatedScenery = [];
+      assetMap = new Map();
+    }
+  } else {
+    console.log("4) NANO_BANANA_API_URL not configured. Using Stable Diffusion-only rendering.");
+  }
 
   const assembled = [];
-  console.log("6) Building page scenes from reusable assets...");
+  console.log("6) Rendering page images...");
   for (const page of storyPages.sort((a, b) => a.pageNumber - b.pageNumber)) {
-    const imagePrompt = await makeImagePrompt(page);
-    const scenePlan = await planPageContinuityScene({ page, assetPlan: continuityAssetPlan });
+    const imagePrompt = await withRetry(() => makeImagePrompt(page), { name: `build image prompt page ${page.pageNumber}` });
     const imagePath = path.join(imagesDir, `page-${String(page.pageNumber).padStart(2, "0")}.png`);
-
-    const renderResult = await generateImageFromContinuityAssets({
-      scenePlan,
-      assetMap,
-      outputPath: imagePath,
-      fallbackPrompt: imagePrompt
-    });
+    let renderResult;
+    let scenePlan = null;
+    if (continuityAssetPlan) {
+      scenePlan = await withRetry(
+        () => planPageContinuityScene({ page, assetPlan: continuityAssetPlan }),
+        { name: `plan continuity scene page ${page.pageNumber}` }
+      );
+      renderResult = await generateImageFromContinuityAssets({
+        scenePlan,
+        assetMap,
+        outputPath: imagePath,
+        fallbackPrompt: imagePrompt
+      });
+    } else {
+      await generateImageWithStableDiffusion(imagePrompt, imagePath);
+      renderResult = { imagePath, renderer: "stable-diffusion" };
+    }
 
     const bundle = {
       ...page,
@@ -571,9 +659,10 @@ async function main() {
   });
 
   const continuityAssetManifest = {
-    styleAnchor: continuityAssetPlan.styleAnchor,
+    styleAnchor: continuityAssetPlan?.styleAnchor ?? null,
     characters: generatedCharacters.map(({ imageDataUri, ...rest }) => rest),
-    scenery: generatedScenery.map(({ imageDataUri, ...rest }) => rest)
+    scenery: generatedScenery.map(({ imageDataUri, ...rest }) => rest),
+    mode: continuityAssetPlan ? "nano-banana-continuity" : "stable-diffusion-only"
   };
 
   await writeFile(path.join(args.outDir, "concept.json"), JSON.stringify(concept, null, 2));

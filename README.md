@@ -8,7 +8,8 @@ AI Children’s Book Creator Agent is a JavaScript + Bun pipeline that:
 4. Plans reusable **continuity assets** (character sheets + scenery anchors).
 5. Uses the **Google Nano Banana API** (if configured) to generate assets and compose each page scene by reusing those assets.
 6. Falls back to Stable Diffusion if scene composition fails for any page.
-7. Combines text + images in order and exports an **EPUB e-book**.
+7. Automatically switches to a **Stable Diffusion-only mode** when Nano Banana is not configured or continuity asset generation fails, so books can still be produced from a prompt.
+8. Combines text + images in order and exports an **EPUB e-book**.
 
 ## Requirements
 
@@ -90,10 +91,12 @@ The `output/` folder will contain:
 - The pipeline first creates reusable character and scenery assets from story context.
 - Each page is then composed from those assets in new scenes (different actions/places), preserving visual continuity.
 - If the Nano Banana scene composition call fails for a page, the page is rendered via Stable Diffusion using a generated fallback prompt.
+- If Nano Banana is unavailable, the system still completes the entire book by rendering all pages directly with Stable Diffusion.
 
 ## Notes
 
 - The script validates intermediate model JSON with `zod`.
+- The script includes JSON extraction + retry/repair logic so malformed model output is less likely to crash full generation runs.
 - If llama.cpp returns text around JSON, ensure your model follows structured output instructions.
 - If using cloud providers, ensure the correct API key env var is set for your selected `LLM_PROVIDER`.
 - Nano Banana response handling expects `{ imageBase64: "..." }` payloads for both asset generation and scene composition.
