@@ -73,6 +73,28 @@ bun run src/index.js \
   --out output
 ```
 
+### Autonomous idea mode
+
+You can let the system invent its own book ideas and keep generating books until a limit is reached.
+
+```bash
+bun run src/index.js \
+  --auto-ideas \
+  --idea-seed "gentle bedtime stories with animals and emotional growth" \
+  --max-books 3 \
+  --max-minutes 45 \
+  --author "AI Story Studio" \
+  --pages 10 \
+  --out output
+```
+
+In `--auto-ideas` mode, you must provide at least one stopping limit:
+
+- `--max-books <n>`: pause after creating `n` books
+- `--max-minutes <n>`: pause when runtime reaches `n` minutes
+
+You can provide either one or both. If both are set, generation stops at whichever limit is reached first.
+
 ## Output
 
 The `output/` folder will contain:
@@ -85,6 +107,12 @@ The `output/` folder will contain:
 - `book.json` - full assembled book payload
 - `images/page-XX.png` - generated page illustrations
 - `<title>.epub` - final e-book
+
+When using autonomous idea mode, each generated book is written to its own folder:
+
+- `output/book-001-<slug>/...`
+- `output/book-002-<slug>/...`
+- `idea.json` inside each folder with the self-generated prompt and rationale
 
 ## Continuity behavior
 

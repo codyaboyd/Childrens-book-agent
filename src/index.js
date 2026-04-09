@@ -56,6 +56,10 @@ const CONTINUITY_SCENE_SCHEMA = z.object({
 function parseArgs(argv) {
   const args = {
     prompt: "",
+    ideaSeed: "",
+    autoIdeas: false,
+    maxBooks: null,
+    maxMinutes: null,
     title: "My AI Storybook",
     author: "Children's Book Agent",
     pages: 10,
@@ -71,6 +75,10 @@ function parseArgs(argv) {
     }
 
     if (token === "--prompt") args.prompt = argv[++i] ?? "";
+    else if (token === "--idea-seed") args.ideaSeed = argv[++i] ?? "";
+    else if (token === "--auto-ideas") args.autoIdeas = true;
+    else if (token === "--max-books") args.maxBooks = Number(argv[++i]);
+    else if (token === "--max-minutes") args.maxMinutes = Number(argv[++i]);
     else if (token === "--title") args.title = argv[++i] ?? args.title;
     else if (token === "--author") args.author = argv[++i] ?? args.author;
     else if (token === "--pages") args.pages = Number(argv[++i] ?? args.pages);
@@ -78,15 +86,27 @@ function parseArgs(argv) {
     else if (token === "--llm-provider") args.llmProvider = argv[++i] ?? args.llmProvider;
   }
 
-  if (!args.prompt.trim()) {
-    throw new Error("Missing --prompt. Use --help for usage.");
+  if (!args.autoIdeas && !args.prompt.trim()) {
+    throw new Error("Missing --prompt (or use --auto-ideas). Use --help for usage.");
+  }
+
+  if (args.maxBooks != null && (!Number.isInteger(args.maxBooks) || args.maxBooks <= 0)) {
+    throw new Error("--max-books must be a positive integer.");
+  }
+
+  if (args.maxMinutes != null && (!Number.isFinite(args.maxMinutes) || args.maxMinutes <= 0)) {
+    throw new Error("--max-minutes must be a positive number.");
+  }
+
+  if (args.autoIdeas && args.maxBooks == null && args.maxMinutes == null) {
+    throw new Error("--auto-ideas requires at least one stop limit: --max-books or --max-minutes.");
   }
 
   return args;
 }
 
 function printHelp() {
-  console.log(`\nChildren's Book Agent (Bun + JavaScript)\n\nUsage:\n  bun run src/index.js --prompt \"A shy dragon learns to sing\" [options]\n\nOptions:\n  --title         <string>   Ebook title (default: My AI Storybook)\n  --author        <string>   Ebook author (default: Children's Book Agent)\n  --pages         <number>   Number of pages to create (default: 10)\n  --out           <path>     Output directory (default: output)\n  --llm-provider  <name>     llama | gpt | gemini | claude | lechat (default: llama)\n  --help                     Show this help\n\nEnvironment:\n  LLM_PROVIDER            Default: llama\n\n  # llama.cpp-compatible (provider: llama)\n  LLAMA_API_URL           Default: http://127.0.0.1:8080/v1/chat/completions\n  LLAMA_MODEL             Default: local-model\n\n  # OpenAI GPT (provider: gpt)\n  OPENAI_API_KEY          Required for gpt provider\n  OPENAI_API_URL          Default: https://api.openai.com/v1/chat/completions\n  OPENAI_MODEL            Default: gpt-4.1-mini\n\n  # Google Gemini (provider: gemini)\n  GEMINI_API_KEY          Required for gemini provider\n  GEMINI_MODEL            Default: gemini-2.0-flash\n\n  # Anthropic Claude (provider: claude)\n  ANTHROPIC_API_KEY       Required for claude provider\n  ANTHROPIC_API_URL       Default: https://api.anthropic.com/v1/messages\n  ANTHROPIC_MODEL         Default: claude-3-7-sonnet-latest\n\n  # Le Chat / Mistral-compatible (provider: lechat)\n  LECHAT_API_KEY          Required for lechat provider\n  LECHAT_API_URL          Default: https://api.mistral.ai/v1/chat/completions\n  LECHAT_MODEL            Default: mistral-large-latest\n\n  # Image generation\n  NANO_BANANA_API_URL     Optional. Endpoint for Google Nano Banana image generation + scene composition\n  NANO_BANANA_API_KEY     Optional auth token sent as Bearer\n  SD_API_URL              Default: http://127.0.0.1:7860/sdapi/v1/txt2img (fallback if Nano Banana fails)\n  SD_STEPS                Default: 30\n  SD_WIDTH                Default: 768\n  SD_HEIGHT               Default: 768\n`);
+  console.log(`\nChildren's Book Agent (Bun + JavaScript)\n\nUsage:\n  bun run src/index.js --prompt \"A shy dragon learns to sing\" [options]\n  bun run src/index.js --auto-ideas --max-books 3 [options]\n\nOptions:\n  --prompt        <string>   Story seed prompt for a single book\n  --auto-ideas               Generate book ideas automatically (no --prompt needed)\n  --idea-seed     <string>   Optional theme guidance for auto-idea mode\n  --max-books     <number>   Stop after this many auto-generated books\n  --max-minutes   <number>   Stop auto mode after this many minutes\n  --title         <string>   Ebook title (default: My AI Storybook)\n  --author        <string>   Ebook author (default: Children's Book Agent)\n  --pages         <number>   Number of pages to create (default: 10)\n  --out           <path>     Output directory (default: output)\n  --llm-provider  <name>     llama | gpt | gemini | claude | lechat (default: llama)\n  --help                     Show this help\n\nEnvironment:\n  LLM_PROVIDER            Default: llama\n\n  # llama.cpp-compatible (provider: llama)\n  LLAMA_API_URL           Default: http://127.0.0.1:8080/v1/chat/completions\n  LLAMA_MODEL             Default: local-model\n\n  # OpenAI GPT (provider: gpt)\n  OPENAI_API_KEY          Required for gpt provider\n  OPENAI_API_URL          Default: https://api.openai.com/v1/chat/completions\n  OPENAI_MODEL            Default: gpt-4.1-mini\n\n  # Google Gemini (provider: gemini)\n  GEMINI_API_KEY          Required for gemini provider\n  GEMINI_MODEL            Default: gemini-2.0-flash\n\n  # Anthropic Claude (provider: claude)\n  ANTHROPIC_API_KEY       Required for claude provider\n  ANTHROPIC_API_URL       Default: https://api.anthropic.com/v1/messages\n  ANTHROPIC_MODEL         Default: claude-3-7-sonnet-latest\n\n  # Le Chat / Mistral-compatible (provider: lechat)\n  LECHAT_API_KEY          Required for lechat provider\n  LECHAT_API_URL          Default: https://api.mistral.ai/v1/chat/completions\n  LECHAT_MODEL            Default: mistral-large-latest\n\n  # Image generation\n  NANO_BANANA_API_URL     Optional. Endpoint for Google Nano Banana image generation + scene composition\n  NANO_BANANA_API_KEY     Optional auth token sent as Bearer\n  SD_API_URL              Default: http://127.0.0.1:7860/sdapi/v1/txt2img (fallback if Nano Banana fails)\n  SD_STEPS                Default: 30\n  SD_WIDTH                Default: 768\n  SD_HEIGHT               Default: 768\n`);
 }
 
 function resolveLlmProvider() {
@@ -303,6 +323,28 @@ async function generateConcept(seedPrompt) {
     user: `Create one children's book concept from this seed:\n${seedPrompt}\n\nReturn JSON only with keys: title, audience, coreLesson, setting, characters.`
   });
   return CONCEPT_SCHEMA.parse(parseJsonFromModel(content));
+}
+
+async function generateAutonomousIdea(ideaSeed) {
+  const content = await callLlm({
+    system: "You invent delightful, marketable, age-appropriate children's book ideas.",
+    user: `Create one fresh children's picture-book idea. ${ideaSeed ? `Theme guidance: ${ideaSeed}` : "No theme guidance is required."}
+
+Return JSON only with keys:
+- prompt: a concise seed prompt that can be fed into a book-generation pipeline
+- suggestedTitle: a short title
+- suggestedAudience: age range like "4-8"
+- rationale: one sentence about why this idea is engaging for children.`
+  });
+
+  return z
+    .object({
+      prompt: z.string().min(8),
+      suggestedTitle: z.string().min(3),
+      suggestedAudience: z.string().min(2),
+      rationale: z.string().min(10)
+    })
+    .parse(parseJsonFromModel(content));
 }
 
 async function planPages(concept, pageCount) {
@@ -554,21 +596,20 @@ function escapeHtml(input) {
     .replaceAll("'", "&#39;");
 }
 
-async function main() {
-  const args = parseArgs(process.argv.slice(2));
-  process.env.LLM_PROVIDER = args.llmProvider;
-  await mkdir(args.outDir, { recursive: true });
-  const imagesDir = path.join(args.outDir, "images");
-  const assetsDir = path.join(args.outDir, "assets");
+async function runSingleBook({ prompt, title, author, pages, outDir }) {
+  await mkdir(outDir, { recursive: true });
+  const imagesDir = path.join(outDir, "images");
+  const assetsDir = path.join(outDir, "assets");
   await mkdir(imagesDir, { recursive: true });
   await mkdir(assetsDir, { recursive: true });
 
   console.log("1) Generating concept...");
-  const concept = await withRetry(() => generateConcept(args.prompt), { name: "generate concept" });
-  concept.title = args.title || concept.title;
+  const concept = await withRetry(() => generateConcept(prompt), { name: "generate concept" });
+  concept.title = title || concept.title;
+  const finalTitle = concept.title;
 
   console.log("2) Planning pages...");
-  const beats = await withRetry(() => planPages(concept, args.pages), { name: "plan pages" });
+  const beats = await withRetry(() => planPages(concept, pages), { name: "plan pages" });
 
   console.log("3) Writing page text...");
   let storyPages = await withRetry(() => writePages(concept, beats), { name: "write pages" });
@@ -646,14 +687,14 @@ async function main() {
     };
 
     assembled.push(bundle);
-    await writeFile(path.join(args.outDir, `page-${String(page.pageNumber).padStart(2, "0")}.json`), JSON.stringify(bundle, null, 2));
+    await writeFile(path.join(outDir, `page-${String(page.pageNumber).padStart(2, "0")}.json`), JSON.stringify(bundle, null, 2));
   }
 
   console.log("7) Building ebook...");
-  const ebookPath = path.join(args.outDir, `${slugify(args.title)}.epub`);
+  const ebookPath = path.join(outDir, `${slugify(finalTitle)}.epub`);
   await buildEbook({
-    title: args.title,
-    author: args.author,
+    title: finalTitle,
+    author,
     pages: assembled,
     outputFile: ebookPath
   });
@@ -665,12 +706,64 @@ async function main() {
     mode: continuityAssetPlan ? "nano-banana-continuity" : "stable-diffusion-only"
   };
 
-  await writeFile(path.join(args.outDir, "concept.json"), JSON.stringify(concept, null, 2));
-  await writeFile(path.join(args.outDir, "plan.json"), JSON.stringify(beats, null, 2));
-  await writeFile(path.join(args.outDir, "continuity-assets.json"), JSON.stringify(continuityAssetManifest, null, 2));
-  await writeFile(path.join(args.outDir, "book.json"), JSON.stringify(assembled, null, 2));
+  await writeFile(path.join(outDir, "concept.json"), JSON.stringify(concept, null, 2));
+  await writeFile(path.join(outDir, "plan.json"), JSON.stringify(beats, null, 2));
+  await writeFile(path.join(outDir, "continuity-assets.json"), JSON.stringify(continuityAssetManifest, null, 2));
+  await writeFile(path.join(outDir, "book.json"), JSON.stringify(assembled, null, 2));
 
   console.log(`Done. EPUB written to: ${ebookPath}`);
+  return { ebookPath, concept };
+}
+
+async function main() {
+  const args = parseArgs(process.argv.slice(2));
+  process.env.LLM_PROVIDER = args.llmProvider;
+
+  if (!args.autoIdeas) {
+    await runSingleBook({
+      prompt: args.prompt,
+      title: args.title,
+      author: args.author,
+      pages: args.pages,
+      outDir: args.outDir
+    });
+    return;
+  }
+
+  const deadline = args.maxMinutes == null ? null : Date.now() + args.maxMinutes * 60 * 1000;
+  let created = 0;
+  console.log("Auto-idea mode started.");
+
+  while (true) {
+    if (args.maxBooks != null && created >= args.maxBooks) {
+      console.log(`Stopping auto-idea mode: reached --max-books=${args.maxBooks}.`);
+      break;
+    }
+    if (deadline != null && Date.now() >= deadline) {
+      console.log(`Stopping auto-idea mode: reached --max-minutes=${args.maxMinutes}.`);
+      break;
+    }
+
+    const idea = await withRetry(() => generateAutonomousIdea(args.ideaSeed), { name: "generate autonomous idea" });
+    const bookIndex = created + 1;
+    const bookTitle = idea.suggestedTitle;
+    const bookDir = path.join(args.outDir, `book-${String(bookIndex).padStart(3, "0")}-${slugify(bookTitle) || "untitled"}`);
+
+    console.log(`\n=== Auto book ${bookIndex} ===`);
+    console.log(`Idea prompt: ${idea.prompt}`);
+    console.log(`Rationale: ${idea.rationale}`);
+    await runSingleBook({
+      prompt: idea.prompt,
+      title: bookTitle,
+      author: args.author,
+      pages: args.pages,
+      outDir: bookDir
+    });
+    await writeFile(path.join(bookDir, "idea.json"), JSON.stringify(idea, null, 2));
+    created += 1;
+  }
+
+  console.log(`Auto-idea mode paused after creating ${created} book(s).`);
 }
 
 function slugify(value) {
