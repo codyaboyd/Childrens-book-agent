@@ -51,7 +51,8 @@ function parseArgs(argv) {
     title: "My AI Storybook",
     author: "Children's Book Agent",
     pages: 10,
-    outDir: "output"
+    outDir: "output",
+    llmProvider: process.env.LLM_PROVIDER ?? "llama"
   };
 
   for (let i = 0; i < argv.length; i++) {
@@ -66,6 +67,7 @@ function parseArgs(argv) {
     else if (token === "--author") args.author = argv[++i] ?? args.author;
     else if (token === "--pages") args.pages = Number(argv[++i] ?? args.pages);
     else if (token === "--out") args.outDir = argv[++i] ?? args.outDir;
+    else if (token === "--llm-provider") args.llmProvider = argv[++i] ?? args.llmProvider;
   }
 
   if (!args.prompt.trim()) {
@@ -76,16 +78,161 @@ function parseArgs(argv) {
 }
 
 function printHelp() {
-  console.log(`\nChildren's Book Agent (Bun + JavaScript)\n\nUsage:\n  bun run src/index.js --prompt \"A shy dragon learns to sing\" [options]\n\nOptions:\n  --title  <string>   Ebook title (default: My AI Storybook)\n  --author <string>   Ebook author (default: Children's Book Agent)\n  --pages  <number>   Number of pages to create (default: 10)\n  --out    <path>     Output directory (default: output)\n  --help              Show this help\n\nEnvironment:\n  LLAMA_API_URL           Default: http://127.0.0.1:8080/v1/chat/completions\n  LLAMA_MODEL             Default: local-model\n  NANO_BANANA_API_URL     Optional. Endpoint for Google Nano Banana image generation + scene composition\n  NANO_BANANA_API_KEY     Optional auth token sent as Bearer\n  SD_API_URL              Default: http://127.0.0.1:7860/sdapi/v1/txt2img (fallback if Nano Banana fails)\n  SD_STEPS                Default: 30\n  SD_WIDTH                Default: 768\n  SD_HEIGHT               Default: 768\n`);
+  console.log(`\nChildren's Book Agent (Bun + JavaScript)\n\nUsage:\n  bun run src/index.js --prompt \"A shy dragon learns to sing\" [options]\n\nOptions:\n  --title         <string>   Ebook title (default: My AI Storybook)\n  --author        <string>   Ebook author (default: Children's Book Agent)\n  --pages         <number>   Number of pages to create (default: 10)\n  --out           <path>     Output directory (default: output)\n  --llm-provider  <name>     llama | gpt | gemini | claude | lechat (default: llama)\n  --help                     Show this help\n\nEnvironment:\n  LLM_PROVIDER            Default: llama\n\n  # llama.cpp-compatible (provider: llama)\n  LLAMA_API_URL           Default: http://127.0.0.1:8080/v1/chat/completions\n  LLAMA_MODEL             Default: local-model\n\n  # OpenAI GPT (provider: gpt)\n  OPENAI_API_KEY          Required for gpt provider\n  OPENAI_API_URL          Default: https://api.openai.com/v1/chat/completions\n  OPENAI_MODEL            Default: gpt-4.1-mini\n\n  # Google Gemini (provider: gemini)\n  GEMINI_API_KEY          Required for gemini provider\n  GEMINI_MODEL            Default: gemini-2.0-flash\n\n  # Anthropic Claude (provider: claude)\n  ANTHROPIC_API_KEY       Required for claude provider\n  ANTHROPIC_API_URL       Default: https://api.anthropic.com/v1/messages\n  ANTHROPIC_MODEL         Default: claude-3-7-sonnet-latest\n\n  # Le Chat / Mistral-compatible (provider: lechat)\n  LECHAT_API_KEY          Required for lechat provider\n  LECHAT_API_URL          Default: https://api.mistral.ai/v1/chat/completions\n  LECHAT_MODEL            Default: mistral-large-latest\n\n  # Image generation\n  NANO_BANANA_API_URL     Optional. Endpoint for Google Nano Banana image generation + scene composition\n  NANO_BANANA_API_KEY     Optional auth token sent as Bearer\n  SD_API_URL              Default: http://127.0.0.1:7860/sdapi/v1/txt2img (fallback if Nano Banana fails)\n  SD_STEPS                Default: 30\n  SD_WIDTH                Default: 768\n  SD_HEIGHT               Default: 768\n`);
 }
 
-async function callLlama({ system, user }) {
-  const url = process.env.LLAMA_API_URL ?? "http://127.0.0.1:8080/v1/chat/completions";
-  const model = process.env.LLAMA_MODEL ?? "local-model";
+function resolveLlmProvider() {
+  const rawProvider = (process.env.LLM_PROVIDER ?? "llama").trim().toLowerCase();
+  const allowed = new Set(["llama", "gpt", "gemini", "claude", "lechat"]);
+  if (!allowed.has(rawProvider)) {
+    throw new Error(`Unsupported LLM provider "${rawProvider}". Use one of: llama, gpt, gemini, claude, lechat.`);
+  }
+  return rawProvider;
+}
 
+function extractOpenAiStyleContent(json, providerName) {
+  const content = json?.choices?.[0]?.message?.content;
+  if (!content) {
+    throw new Error(`${providerName} response missing choices[0].message.content`);
+  }
+
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content
+      .map((part) => {
+        if (typeof part === "string") return part;
+        if (typeof part?.text === "string") return part.text;
+        return "";
+      })
+      .join("\n")
+      .trim();
+  }
+
+  return String(content).trim();
+}
+
+async function callLlm({ system, user }) {
+  const provider = resolveLlmProvider();
+
+  if (provider === "llama") {
+    const url = process.env.LLAMA_API_URL ?? "http://127.0.0.1:8080/v1/chat/completions";
+    const model = process.env.LLAMA_MODEL ?? "local-model";
+    const response = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model,
+        temperature: 0.7,
+        messages: [
+          { role: "system", content: system },
+          { role: "user", content: user }
+        ]
+      })
+    });
+    if (!response.ok) {
+      const body = await response.text();
+      throw new Error(`llama.cpp API failed (${response.status}): ${body}`);
+    }
+    return extractOpenAiStyleContent(await response.json(), "llama.cpp");
+  }
+
+  if (provider === "gpt") {
+    const apiKey = process.env.OPENAI_API_KEY?.trim();
+    if (!apiKey) throw new Error("OPENAI_API_KEY is required for provider=gpt");
+    const url = process.env.OPENAI_API_URL ?? "https://api.openai.com/v1/chat/completions";
+    const model = process.env.OPENAI_MODEL ?? "gpt-4.1-mini";
+    const response = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${apiKey}`
+      },
+      body: JSON.stringify({
+        model,
+        temperature: 0.7,
+        messages: [
+          { role: "system", content: system },
+          { role: "user", content: user }
+        ]
+      })
+    });
+    if (!response.ok) {
+      const body = await response.text();
+      throw new Error(`OpenAI API failed (${response.status}): ${body}`);
+    }
+    return extractOpenAiStyleContent(await response.json(), "OpenAI");
+  }
+
+  if (provider === "gemini") {
+    const apiKey = process.env.GEMINI_API_KEY?.trim();
+    if (!apiKey) throw new Error("GEMINI_API_KEY is required for provider=gemini");
+    const model = process.env.GEMINI_MODEL ?? "gemini-2.0-flash";
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(apiKey)}`;
+    const response = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        systemInstruction: { parts: [{ text: system }] },
+        contents: [{ role: "user", parts: [{ text: user }] }],
+        generationConfig: { temperature: 0.7 }
+      })
+    });
+    if (!response.ok) {
+      const body = await response.text();
+      throw new Error(`Gemini API failed (${response.status}): ${body}`);
+    }
+
+    const json = await response.json();
+    const parts = json?.candidates?.[0]?.content?.parts;
+    const content = Array.isArray(parts) ? parts.map((part) => part?.text ?? "").join("\n").trim() : "";
+    if (!content) {
+      throw new Error("Gemini API response missing candidates[0].content.parts[].text");
+    }
+    return content;
+  }
+
+  if (provider === "claude") {
+    const apiKey = process.env.ANTHROPIC_API_KEY?.trim();
+    if (!apiKey) throw new Error("ANTHROPIC_API_KEY is required for provider=claude");
+    const url = process.env.ANTHROPIC_API_URL ?? "https://api.anthropic.com/v1/messages";
+    const model = process.env.ANTHROPIC_MODEL ?? "claude-3-7-sonnet-latest";
+    const response = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": apiKey,
+        "anthropic-version": "2023-06-01"
+      },
+      body: JSON.stringify({
+        model,
+        max_tokens: 2048,
+        temperature: 0.7,
+        system,
+        messages: [{ role: "user", content: user }]
+      })
+    });
+    if (!response.ok) {
+      const body = await response.text();
+      throw new Error(`Claude API failed (${response.status}): ${body}`);
+    }
+    const json = await response.json();
+    const content = json?.content?.find((item) => item?.type === "text")?.text?.trim();
+    if (!content) {
+      throw new Error("Claude API response missing content text");
+    }
+    return content;
+  }
+
+  const apiKey = process.env.LECHAT_API_KEY?.trim();
+  if (!apiKey) throw new Error("LECHAT_API_KEY is required for provider=lechat");
+  const url = process.env.LECHAT_API_URL ?? "https://api.mistral.ai/v1/chat/completions";
+  const model = process.env.LECHAT_MODEL ?? "mistral-large-latest";
   const response = await fetch(url, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${apiKey}`
+    },
     body: JSON.stringify({
       model,
       temperature: 0.7,
@@ -95,19 +242,11 @@ async function callLlama({ system, user }) {
       ]
     })
   });
-
   if (!response.ok) {
     const body = await response.text();
-    throw new Error(`llama.cpp API failed (${response.status}): ${body}`);
+    throw new Error(`Le Chat API failed (${response.status}): ${body}`);
   }
-
-  const json = await response.json();
-  const content = json?.choices?.[0]?.message?.content;
-  if (!content) {
-    throw new Error("llama.cpp API response missing choices[0].message.content");
-  }
-
-  return content;
+  return extractOpenAiStyleContent(await response.json(), "Le Chat");
 }
 
 function parseJsonFromModel(text) {
@@ -133,7 +272,7 @@ async function withRetry(task, { retries = 2, name = "operation" } = {}) {
 }
 
 async function generateConcept(seedPrompt) {
-  const content = await callLlama({
+  const content = await callLlm({
     system: "You create short, age-appropriate children's story concepts.",
     user: `Create one children's book concept from this seed:\n${seedPrompt}\n\nReturn JSON only with keys: title, audience, coreLesson, setting, characters.`
   });
@@ -141,7 +280,7 @@ async function generateConcept(seedPrompt) {
 }
 
 async function planPages(concept, pageCount) {
-  const content = await callLlama({
+  const content = await callLlm({
     system: "You are a children's book planner.",
     user: `Using this concept:\n${JSON.stringify(concept, null, 2)}\n\nCreate exactly ${pageCount} page beats.\nReturn JSON array only. Each item: { pageNumber, label, events: string[] }`
   });
@@ -151,7 +290,7 @@ async function planPages(concept, pageCount) {
 }
 
 async function writePages(concept, beats) {
-  const content = await callLlama({
+  const content = await callLlm({
     system: "You write warm, simple, vivid storybook pages for kids ages 4-8.",
     user: `Write page text from this concept and plan.\n\nConcept:\n${JSON.stringify(concept, null, 2)}\n\nPlan:\n${JSON.stringify(beats, null, 2)}\n\nReturn JSON array only. Each item: { pageNumber, label, text }. Keep each page text to 55-95 words.`
   });
@@ -161,7 +300,7 @@ async function writePages(concept, beats) {
 }
 
 async function makeImagePrompt(page) {
-  const content = await callLlama({
+  const content = await callLlm({
     system: "You convert story text into stable diffusion prompts for illustrated children's books.",
     user: `Create one image prompt for this page. Include character details, setting, mood, camera framing, art style (storybook watercolor), and avoid text overlays.\n\nLabel: ${page.label}\nText: ${page.text}\n\nReturn plain text only.`
   });
@@ -170,7 +309,7 @@ async function makeImagePrompt(page) {
 }
 
 async function planContinuityAssets({ concept, beats, storyPages }) {
-  const content = await callLlama({
+  const content = await callLlm({
     system: "You plan reusable visual assets for continuity in children's picture books.",
     user: `You must return JSON only.\nGiven this concept, beat plan, and story pages, create a reusable visual asset plan.\n\nConcept:\n${JSON.stringify(concept, null, 2)}\n\nBeats:\n${JSON.stringify(beats, null, 2)}\n\nStory Pages:\n${JSON.stringify(storyPages, null, 2)}\n\nRules:\n- Create stable IDs in kebab-case.\n- Include recurring main characters and important scenery/backgrounds that should persist across pages.\n- styleAnchor should define one consistent illustration style for the whole book.\n\nReturn shape:\n{\n  \"styleAnchor\": string,\n  \"characters\": [{ \"id\": string, \"name\": string, \"visualDescription\": string }],\n  \"scenery\": [{ \"id\": string, \"name\": string, \"visualDescription\": string }]\n}`
   });
@@ -179,7 +318,7 @@ async function planContinuityAssets({ concept, beats, storyPages }) {
 }
 
 async function planPageContinuityScene({ page, assetPlan }) {
-  const content = await callLlama({
+  const content = await callLlm({
     system: "You map a story page to reusable visual assets while preserving continuity.",
     user: `Return JSON only.\nGiven this page and asset plan, build a scene composition instruction that reuses only relevant assets.\n\nAsset plan:\n${JSON.stringify(assetPlan, null, 2)}\n\nPage:\n${JSON.stringify(page, null, 2)}\n\nRules:\n- characterAssetIds and sceneryAssetIds must be arrays of IDs from the asset plan.\n- sceneDescription should explain actions, camera, and mood while preserving visual consistency from styleAnchor.\n\nReturn shape:\n{\n  \"pageNumber\": number,\n  \"sceneDescription\": string,\n  \"characterAssetIds\": string[],\n  \"sceneryAssetIds\": string[]\n}`
   });
@@ -365,6 +504,7 @@ function escapeHtml(input) {
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
+  process.env.LLM_PROVIDER = args.llmProvider;
   await mkdir(args.outDir, { recursive: true });
   const imagesDir = path.join(args.outDir, "images");
   const assetsDir = path.join(args.outDir, "assets");
