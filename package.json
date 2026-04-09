@@ -1,0 +1,14 @@
+{
+  "name": "childrens-book-agent",
+  "version": "1.0.0",
+  "description": "Pipeline agent that creates children's ebooks with llama.cpp and Stable Diffusion APIs using Bun",
+  "type": "module",
+  "scripts": {
+    "start": "bun run src/index.js",
+    "check": "bun run src/index.js --help"
+  },
+  "dependencies": {
+    "epub-gen": "^0.1.0",
+    "zod": "^3.24.1"
+  }
+}
