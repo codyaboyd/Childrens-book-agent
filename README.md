@@ -5,11 +5,13 @@ AI Children’s Book Creator Agent is a JavaScript + Bun pipeline that:
 1. Generates a **book concept** from a text prompt using a selectable LLM provider (llama.cpp, GPT, Gemini, Claude, or Le Chat).
 2. Converts the concept into a **page-by-page beat list**.
 3. Writes each page’s story text.
-4. Plans reusable **continuity assets** (character sheets + scenery anchors).
-5. Uses the **Google Nano Banana API** (if configured) to generate assets and compose each page scene by reusing those assets.
-6. Falls back to Stable Diffusion if scene composition fails for any page.
-7. Automatically switches to a **Stable Diffusion-only mode** when Nano Banana is not configured or continuity asset generation fails, so books can still be produced from a prompt.
-8. Combines text + images in order and exports an **EPUB e-book**.
+4. Builds a **story bible** (style guide, character continuity traits, setting anchors, and banned visual elements).
+5. Plans reusable **continuity assets** (character sheets + scenery anchors).
+6. Creates a per-page **scene brief refinement pass** (visual summary, continuity checklist, camera, palette).
+7. Uses the **Google Nano Banana API** (if configured) to generate assets and compose each page scene by reusing those assets.
+8. Falls back to Stable Diffusion if scene composition fails for any page.
+9. Automatically switches to a **Stable Diffusion-only mode** when Nano Banana is not configured or continuity asset generation fails, so books can still be produced from a prompt.
+10. Combines text + images in order and exports an **EPUB e-book**.
 
 ## Requirements
 
@@ -101,9 +103,10 @@ The `output/` folder will contain:
 
 - `concept.json` - generated concept metadata
 - `plan.json` - page beat plan
+- `story-bible.json` - style + continuity rules used to improve visual fidelity
 - `continuity-assets.json` - reusable generated character/scenery asset manifest
 - `assets/*.png` - rendered reusable character/scenery assets
-- `page-XX.json` - each page’s text + scene composition + image metadata
+- `page-XX.json` - each page’s text + scene brief + scene composition + image metadata
 - `book.json` - full assembled book payload
 - `images/page-XX.png` - generated page illustrations
 - `<title>.epub` - final e-book
