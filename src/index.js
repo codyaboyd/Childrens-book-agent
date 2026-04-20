@@ -53,6 +53,27 @@ const CONTINUITY_SCENE_SCHEMA = z.object({
   sceneryAssetIds: z.array(z.string())
 });
 
+const STORY_BIBLE_SCHEMA = z.object({
+  styleGuide: z.string().min(20),
+  characterContinuity: z.array(
+    z.object({
+      name: z.string().min(2),
+      visualTraits: z.array(z.string().min(2)).min(1),
+      emotionalArc: z.string().min(10)
+    })
+  ),
+  settingContinuity: z.array(z.string().min(5)).min(1),
+  bannedVisualElements: z.array(z.string().min(2)).min(1)
+});
+
+const SCENE_BRIEF_SCHEMA = z.object({
+  pageNumber: z.number().int().positive(),
+  visualSummary: z.string().min(20),
+  continuityChecklist: z.array(z.string().min(5)).min(2),
+  cameraAndComposition: z.string().min(10),
+  lightingAndPalette: z.string().min(10)
+});
+
 function parseArgs(argv) {
   const args = {
     prompt: "",
@@ -440,10 +461,32 @@ function alignStoryPageLabelsWithPlan(storyPages, beats) {
   }));
 }
 
-async function makeImagePrompt(page) {
+async function generateStoryBible({ concept, beats, storyPages }) {
   const content = await callLlm({
-    system: "You convert story text into stable diffusion prompts for illustrated children's books.",
-    user: `Create one image prompt for this page. Include character details, setting, mood, camera framing, art style (storybook watercolor), and avoid text overlays.\n\nLabel: ${page.label}\nText: ${page.text}\n\nReturn plain text only.`
+    system: "You create a continuity bible that keeps picture-book visuals and tone consistent.",
+    user: `Return JSON only. Build a compact story bible from this concept, beat plan, and full page text.\n\nConcept:\n${JSON.stringify(concept, null, 2)}\n\nBeats:\n${JSON.stringify(beats, null, 2)}\n\nStory Pages:\n${JSON.stringify(storyPages, null, 2)}\n\nReturn shape:\n{\n  "styleGuide": string,\n  "characterContinuity": [{ "name": string, "visualTraits": string[], "emotionalArc": string }],\n  "settingContinuity": string[],\n  "bannedVisualElements": string[]\n}`
+  });
+
+  return STORY_BIBLE_SCHEMA.parse(parseJsonFromModel(content));
+}
+
+async function planSceneBrief({ page, previousPage, storyBible }) {
+  const content = await callLlm({
+    system: "You are a visual director for children's books. Preserve cross-page continuity exactly.",
+    user: `Return JSON only. Create a detailed scene brief for one page that references continuity rules.\n\nStory Bible:\n${JSON.stringify(storyBible, null, 2)}\n\nCurrent Page:\n${JSON.stringify(page, null, 2)}\n\nPrevious Page (if any):\n${previousPage ? JSON.stringify(previousPage, null, 2) : "none"}\n\nReturn shape:\n{\n  "pageNumber": number,\n  "visualSummary": string,\n  "continuityChecklist": string[],\n  "cameraAndComposition": string,\n  "lightingAndPalette": string\n}`
+  });
+
+  return SCENE_BRIEF_SCHEMA.parse(parseJsonFromModel(content));
+}
+
+async function makeImagePromptFromBrief({ page, sceneBrief, storyBible }) {
+  const content = await callLlm({
+    system: "You convert structured scene briefs into stable diffusion prompts for illustrated children's books.",
+    user: `Create one polished image prompt that keeps strict visual continuity and child-safe tone.\n\nPage:\n${JSON.stringify(page, null, 2)}\n\nScene brief:\n${JSON.stringify(sceneBrief, null, 2)}\n\nStory bible:\n${JSON.stringify(storyBible, null, 2)}\n\nRules:\n- Keep style consistent with story bible styleGuide.
+- Explicitly include key character traits and setting anchors.
+- Include camera and palette instructions.
+- Avoid text overlays, logos, and frightening imagery.
+- Return plain text only.`
   });
 
   return content.replace(/^"|"$/g, "").trim();
@@ -678,20 +721,27 @@ async function runSingleBook({ prompt, title, author, pages, outDir }) {
   }
 
   let continuityAssetPlan = null;
+  let storyBible = null;
   let generatedCharacters = [];
   let generatedScenery = [];
   let assetMap = new Map();
   const nanoBananaEnabled = Boolean(resolveNanoBananaConfig());
 
+  console.log("4) Building story bible for continuity and style fidelity...");
+  storyBible = await withRetry(
+    () => generateStoryBible({ concept, beats, storyPages }),
+    { name: "generate story bible" }
+  );
+
   if (nanoBananaEnabled) {
     try {
-      console.log("4) Planning reusable continuity assets...");
+      console.log("5) Planning reusable continuity assets...");
       continuityAssetPlan = await withRetry(
         () => planContinuityAssets({ concept, beats, storyPages }),
         { name: "plan continuity assets" }
       );
 
-      console.log("5) Generating continuity asset images...");
+      console.log("6) Generating continuity asset images...");
       generatedCharacters = await Promise.all(
         continuityAssetPlan.characters.map((asset) => generateContinuityAsset(asset, "character", continuityAssetPlan.styleAnchor, assetsDir))
       );
@@ -711,9 +761,19 @@ async function runSingleBook({ prompt, title, author, pages, outDir }) {
   }
 
   const assembled = [];
-  console.log("6) Rendering page images...");
-  for (const page of storyPages.sort((a, b) => a.pageNumber - b.pageNumber)) {
-    const imagePrompt = await withRetry(() => makeImagePrompt(page), { name: `build image prompt page ${page.pageNumber}` });
+  console.log("7) Rendering page images with scene refinement...");
+  const orderedPages = storyPages.sort((a, b) => a.pageNumber - b.pageNumber);
+  for (let index = 0; index < orderedPages.length; index++) {
+    const page = orderedPages[index];
+    const previousPage = index > 0 ? orderedPages[index - 1] : null;
+    const sceneBrief = await withRetry(
+      () => planSceneBrief({ page, previousPage, storyBible }),
+      { name: `plan scene brief page ${page.pageNumber}` }
+    );
+    const imagePrompt = await withRetry(
+      () => makeImagePromptFromBrief({ page, sceneBrief, storyBible }),
+      { name: `build image prompt page ${page.pageNumber}` }
+    );
     const imagePath = path.join(imagesDir, `page-${String(page.pageNumber).padStart(2, "0")}.png`);
     let renderResult;
     let scenePlan = null;
@@ -739,14 +799,15 @@ async function runSingleBook({ prompt, title, author, pages, outDir }) {
       imagePath: renderResult.imagePath,
       renderer: renderResult.renderer,
       fallbackReason: renderResult.fallbackReason ?? null,
-      scenePlan
+      scenePlan,
+      sceneBrief
     };
 
     assembled.push(bundle);
     await writeFile(path.join(outDir, `page-${String(page.pageNumber).padStart(2, "0")}.json`), JSON.stringify(bundle, null, 2));
   }
 
-  console.log("7) Building ebook...");
+  console.log("8) Building ebook...");
   const ebookPath = path.join(outDir, `${slugify(finalTitle)}.epub`);
   await buildEbook({
     title: finalTitle,
@@ -764,6 +825,7 @@ async function runSingleBook({ prompt, title, author, pages, outDir }) {
 
   await writeFile(path.join(outDir, "concept.json"), JSON.stringify(concept, null, 2));
   await writeFile(path.join(outDir, "plan.json"), JSON.stringify(beats, null, 2));
+  await writeFile(path.join(outDir, "story-bible.json"), JSON.stringify(storyBible, null, 2));
   await writeFile(path.join(outDir, "continuity-assets.json"), JSON.stringify(continuityAssetManifest, null, 2));
   await writeFile(path.join(outDir, "book.json"), JSON.stringify(assembled, null, 2));
 
