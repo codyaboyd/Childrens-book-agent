@@ -123,6 +123,10 @@ function parseArgs(argv) {
     throw new Error("--auto-ideas requires at least one stop limit: --max-books or --max-minutes.");
   }
 
+  if (!Number.isInteger(args.pages) || args.pages <= 0) {
+    throw new Error("--pages must be a positive integer.");
+  }
+
   return args;
 }
 
@@ -298,26 +302,71 @@ async function callLlm({ system, user, temperature = 0.4 }) {
   return extractOpenAiStyleContent(await response.json(), "Le Chat");
 }
 
-function parseJsonFromModel(text) {
-  const cleaned = text
+function normalizeJsonCandidate(text) {
+  return text
     .replace(/^```json\s*/i, "")
     .replace(/^```/i, "")
     .replace(/```$/i, "")
+    .replace(/[“”]/g, '"')
+    .replace(/[‘’]/g, "'")
+    .replace(/,\s*([}\]])/g, "$1")
     .trim();
+}
+
+function extractBalancedJsonSlice(text) {
+  const startObject = text.indexOf("{");
+  const startArray = text.indexOf("[");
+  const start = startObject === -1 ? startArray : startArray === -1 ? startObject : Math.min(startObject, startArray);
+  if (start === -1) return null;
+
+  const stack = [];
+  let inString = false;
+  let escaped = false;
+  for (let i = start; i < text.length; i++) {
+    const char = text[i];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (char === "\\") escaped = true;
+      else if (char === '"') inString = false;
+      continue;
+    }
+
+    if (char === '"') {
+      inString = true;
+      continue;
+    }
+
+    if (char === "{" || char === "[") stack.push(char);
+    if (char === "}" || char === "]") {
+      const open = stack.pop();
+      if (!open) return null;
+      if ((open === "{" && char !== "}") || (open === "[" && char !== "]")) return null;
+      if (stack.length === 0) {
+        return text.slice(start, i + 1);
+      }
+    }
+  }
+
+  return null;
+}
+
+function parseJsonFromModel(text) {
+  const cleaned = normalizeJsonCandidate(text);
 
   try {
     return JSON.parse(cleaned);
-  } catch {
-    const startObject = cleaned.indexOf("{");
-    const startArray = cleaned.indexOf("[");
-    const start = startObject === -1 ? startArray : startArray === -1 ? startObject : Math.min(startObject, startArray);
-    const endObject = cleaned.lastIndexOf("}");
-    const endArray = cleaned.lastIndexOf("]");
-    const end = Math.max(endObject, endArray);
-    if (start === -1 || end === -1 || end <= start) {
-      throw new Error("Model output did not contain valid JSON.");
+  } catch (firstError) {
+    const balancedSlice = extractBalancedJsonSlice(cleaned);
+    if (balancedSlice) {
+      try {
+        return JSON.parse(balancedSlice);
+      } catch {
+        // Continue to final error below to include original output preview.
+      }
     }
-    return JSON.parse(cleaned.slice(start, end + 1));
+
+    const preview = cleaned.slice(0, 240).replace(/\s+/g, " ");
+    throw new Error(`Model output did not contain valid JSON. Preview: ${preview}. Parse error: ${firstError.message}`);
   }
 }
 
@@ -505,6 +554,43 @@ async function planPageContinuityScene({ page, assetPlan }) {
   const content = await callLlm({
     system: "You map a story page to reusable visual assets while preserving continuity.",
     user: `Return JSON only.\nGiven this page and asset plan, build a scene composition instruction that reuses only relevant assets.\n\nAsset plan:\n${JSON.stringify(assetPlan, null, 2)}\n\nPage:\n${JSON.stringify(page, null, 2)}\n\nRules:\n- characterAssetIds and sceneryAssetIds must be arrays of IDs from the asset plan.\n- sceneDescription should explain actions, camera, and mood while preserving visual consistency from styleAnchor.\n\nReturn shape:\n{\n  \"pageNumber\": number,\n  \"sceneDescription\": string,\n  \"characterAssetIds\": string[],\n  \"sceneryAssetIds\": string[]\n}`
+  });
+
+  return CONTINUITY_SCENE_SCHEMA.parse(parseJsonFromModel(content));
+}
+
+function validateScenePlanAssets(scenePlan, assetPlan) {
+  const knownIds = new Set([
+    ...assetPlan.characters.map((asset) => asset.id),
+    ...assetPlan.scenery.map((asset) => asset.id)
+  ]);
+
+  const referencedIds = [...scenePlan.characterAssetIds, ...scenePlan.sceneryAssetIds];
+  const unknownIds = referencedIds.filter((id) => !knownIds.has(id));
+  if (unknownIds.length > 0) {
+    throw new Error(`Scene plan has unknown asset IDs: ${unknownIds.join(", ")}`);
+  }
+}
+
+async function repairContinuityScenePlan({ page, assetPlan, brokenScenePlan }) {
+  const content = await callLlm({
+    system: "You repair scene composition JSON by strictly using available asset IDs.",
+    user: `Repair this continuity scene plan so it uses only known asset IDs and valid structure.
+
+Asset plan:
+${JSON.stringify(assetPlan, null, 2)}
+
+Page:
+${JSON.stringify(page, null, 2)}
+
+Broken scene plan:
+${JSON.stringify(brokenScenePlan, null, 2)}
+
+Rules:
+- pageNumber must match the page.
+- characterAssetIds and sceneryAssetIds must use IDs that exist in the asset plan.
+- Return JSON only in this shape:
+{ "pageNumber": number, "sceneDescription": string, "characterAssetIds": string[], "sceneryAssetIds": string[] }`
   });
 
   return CONTINUITY_SCENE_SCHEMA.parse(parseJsonFromModel(content));
@@ -782,6 +868,16 @@ async function runSingleBook({ prompt, title, author, pages, outDir }) {
         () => planPageContinuityScene({ page, assetPlan: continuityAssetPlan }),
         { name: `plan continuity scene page ${page.pageNumber}` }
       );
+      try {
+        validateScenePlanAssets(scenePlan, continuityAssetPlan);
+      } catch (error) {
+        console.warn(`Scene plan validation failed for page ${page.pageNumber}. Repairing once... (${error.message})`);
+        scenePlan = await withRetry(
+          () => repairContinuityScenePlan({ page, assetPlan: continuityAssetPlan, brokenScenePlan: scenePlan }),
+          { name: `repair continuity scene page ${page.pageNumber}` }
+        );
+        validateScenePlanAssets(scenePlan, continuityAssetPlan);
+      }
       renderResult = await generateImageFromContinuityAssets({
         scenePlan,
         assetMap,
